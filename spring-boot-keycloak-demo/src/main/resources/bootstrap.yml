@@ -1,0 +1,12 @@
+server:
+  port: 8080
+KEYCLOAK-SERVER: ${ENV_KEYCLOAK_SERVER:http://localhost:8081}
+
+spring:
+  application:
+    name: spring-boot-keycloak-demo
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          jwk-set-uri: ${KEYCLOAK-SERVER}/realms/default/protocol/openid-connect/certs
