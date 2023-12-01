@@ -1,6 +1,8 @@
 ## 用keycloak保护一个springboot接口程序
 ### docker安装keycloak
-`docker run -p 8080:8080 -e KEYCLOAK_ADMIN=admin -e KEYCLOAK_ADMIN_PASSWORD=admin quay.io/keycloak/keycloak:21.1.2 start-dev`
+```
+docker run -p 8080:8080 -e KEYCLOAK_ADMIN=admin -e KEYCLOAK_ADMIN_PASSWORD=admin quay.io/keycloak/keycloak:21.1.2 start-dev
+```
 以上命令会使用keycloak21.1.2版本启动,访问端口8080,keycloak管理员账户密码admin/admin,打开localhost:8080登录后看到keycloak master管理界面
 ![main page](./images/main_page.png)
 可以看到有很多菜单,我们需要理解一些keycloak的概念:
@@ -93,4 +95,170 @@ URI，用于在用户授权后将令牌传递回客户端应用程序。这是�
 分配角色
 ![bind user role](./images/bind_user_role.png)
 ## 搭建springboot api demo
-### 
+### 依赖spring oauth2
+```
+<dependencies>
+   <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-oauth2-resource-server</artifactId>
+   </dependency>
+   <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-web</artifactId>
+   </dependency>
+</dependencies>
+```
+### Security配置类
+```java
+
+@Configuration
+@EnableWebSecurity
+@EnableMethodSecurity(prePostEnabled = true, securedEnabled = true, jsr250Enabled = true)
+public class ResourceServerConfig extends WebSecurityConfigurerAdapter {
+
+   @Override
+   protected void configure(HttpSecurity http) throws Exception {
+      http.csrf().disable().oauth2ResourceServer()
+              .jwt(jwt -> jwt.jwtAuthenticationConverter(jwtAuthenticationConverter()))
+              .authenticationEntryPoint(authenticationEntryPoint()).accessDeniedHandler(accessDeniedHandler()).and()
+              .exceptionHandling().accessDeniedHandler(accessDeniedHandler());
+   }
+
+   @Bean
+   public AccessDeniedHandler accessDeniedHandler() {
+      return new CustomAccessDeniedHandler();
+   }
+
+   @Bean
+   public AuthenticationEntryPoint authenticationEntryPoint() {
+      return new CustomAuthenticationEntryPoint();
+   }
+
+   private Converter<Jwt, ? extends AbstractAuthenticationToken> jwtAuthenticationConverter() {
+      JwtAuthenticationConverter jwtConverter = new JwtAuthenticationConverter();
+      jwtConverter.setJwtGrantedAuthoritiesConverter(new RealmRoleConverter());
+      return jwtConverter;
+   }
+
+   private class CustomAuthenticationEntryPoint implements AuthenticationEntryPoint {
+
+      @Autowired
+      @Qualifier("handlerExceptionResolver")
+      private HandlerExceptionResolver resolver;
+
+      @Override
+      public void commence(HttpServletRequest request, HttpServletResponse response, AuthenticationException e)
+              throws IOException, ServletException {
+
+         resolver.resolveException(request, response, null, e);
+      }
+   }
+
+   private class CustomAccessDeniedHandler implements AccessDeniedHandler {
+
+      @Override
+      public void handle(HttpServletRequest request, HttpServletResponse response,
+                         AccessDeniedException accessDeniedException) throws IOException, ServletException {
+         response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
+         response.setContentType(MediaType.APPLICATION_JSON_VALUE);
+         response.getWriter().write("Unauthorized Call");
+      }
+   }
+}
+```
+### keycloak角色转换器
+```java
+public class RealmRoleConverter implements Converter<Jwt, Collection<GrantedAuthority>> {
+   @Override
+   public Collection<GrantedAuthority> convert(Jwt jwt) {
+      final Map<String, List<String>> realmAccess = (Map<String, List<String>>)jwt.getClaims().get("realm_access");
+      return realmAccess.get("roles").stream()
+              // prefix required by Spring Security for roles.
+              .map(SimpleGrantedAuthority::new).collect(Collectors.toList());
+   }
+}
+```
+keycloak的角色信息存储在jwt token claim中的real_access中的roles里面,与标准的oauth2 claim不一样所以需要转换
+### bootstrap.yaml配置文件
+```yaml
+server:
+   port: 8080
+#keycloak服务器地址
+KEYCLOAK-SERVER: ${ENV_KEYCLOAK_SERVER:http://localhost:8081}
+
+spring:
+   application:
+      name: spring-boot-keycloak-demo
+   security:
+      oauth2:
+         resourceserver:
+            jwt:
+               #用于验签的公钥地址
+               jwk-set-uri: ${KEYCLOAK-SERVER}/realms/default/protocol/openid-connect/certs
+```
+## 测试
+### 使用direct password grant获取access token
+```shell
+curl \
+  -d "client_id=demo_client" \
+  -d "client_secret=bpzmUHotcP0LeCwh7IMtM6T6krIDzT67" \
+  -d "username=user" \
+  -d "password=123" \
+  -d "grant_type=password" \
+  "http://localhost:8080/realms/demo_realm/protocol/openid-connect/token"
+```
+返回的是access token和refresh token,2个token都是jwt格式,默认access token有效期是5分钟,在realm setting里可以修改过期时间,access token过期后
+使用refresh token来刷新生成新的access token和refresh token
+```json
+{
+    "access_token": "eyJhbGciOiJSUzI1NiIsInR5cCIgOiAiSldUIiwia2lkIiA6ICIxT3o1NFZQWEo0eHJxUm9LUlZfR19HVi0zTVYzbWdJUEw0TU5FSWE0YjBvIn0.eyJleHAiOjE3MDEzOTUyMjcsImlhdCI6MTcwMTM5NDkyNywianRpIjoiZGM3YmYxOGEtMTQxMC00ZWY5LWI5ZWYtY2IxNjIxOGM3YzQwIiwiaXNzIjoiaHR0cDovL2xvY2FsaG9zdDo4MDgxL3JlYWxtcy9kZW1vX3JlYWxtIiwiYXVkIjoiYWNjb3VudCIsInN1YiI6ImM1NzE4ZjdlLWQ2MjYtNDMyZi04ZGM3LTUyMDA4NmUzMGExMCIsInR5cCI6IkJlYXJlciIsImF6cCI6ImRlbW9fY2xpZW50Iiwic2Vzc2lvbl9zdGF0ZSI6IjNkMTQ2OTk1LTY2ZjYtNGEyNS04N2U3LTkxYzczMTcxNTBlMCIsImFjciI6IjEiLCJhbGxvd2VkLW9yaWdpbnMiOlsiKiJdLCJyZWFsbV9hY2Nlc3MiOnsicm9sZXMiOlsidXNlci1yb2xlIiwiZGVmYXVsdC1yb2xlcy1kZW1vX3JlYWxtIiwib2ZmbGluZV9hY2Nlc3MiLCJ1bWFfYXV0aG9yaXphdGlvbiJdfSwicmVzb3VyY2VfYWNjZXNzIjp7ImFjY291bnQiOnsicm9sZXMiOlsibWFuYWdlLWFjY291bnQiLCJtYW5hZ2UtYWNjb3VudC1saW5rcyIsInZpZXctcHJvZmlsZSJdfX0sInNjb3BlIjoicHJvZmlsZSBlbWFpbCIsInNpZCI6IjNkMTQ2OTk1LTY2ZjYtNGEyNS04N2U3LTkxYzczMTcxNTBlMCIsImVtYWlsX3ZlcmlmaWVkIjpmYWxzZSwicHJlZmVycmVkX3VzZXJuYW1lIjoidXNlciIsImdpdmVuX25hbWUiOiIiLCJmYW1pbHlfbmFtZSI6IiJ9.NKZjBkiXDxh0nFsQuUkphWNz62RgCRkcBy9nOlx7gm2g4aajWy1CvZcOKOf326jbAOElz7iN1hgG56CbLoq7B-FLwAtaOPBF_cg5w4mBzk3v8rWY4KECRLmVECIdVfqe9BScZ6G87wEfGwjDfg7GkpLs9cTLPL0HWsLtOVI5o_07ukLbaUosWdQrj6Yg6APDD56braHv0hDODYjhYCh357tLeLk_Dq2q5LRyf9SJsoRoDjH_m7fbGIjs_UOYnUBg8w5sStCl1_GpX25EyUUis0CzJFrlJuJcRkSPW9us7IzWNFKQavEabFVFGGPMT6H-I_YKxsOl4eJ5yH8m8-p-gg",
+    "expires_in": 300,
+    "refresh_expires_in": 1800,
+    "refresh_token": "eyJhbGciOiJIUzI1NiIsInR5cCIgOiAiSldUIiwia2lkIiA6ICJkM2I3YTg2MS0zM2E0LTRmOGQtOGE3ZC1hYjg0ZjgwMjA1NjgifQ.eyJleHAiOjE3MDEzOTY3MjcsImlhdCI6MTcwMTM5NDkyNywianRpIjoiMDczNzNiMGItYWYxOC00M2ZlLTkyYjAtN2UxYjBmODk4MDU5IiwiaXNzIjoiaHR0cDovL2xvY2FsaG9zdDo4MDgxL3JlYWxtcy9kZW1vX3JlYWxtIiwiYXVkIjoiaHR0cDovL2xvY2FsaG9zdDo4MDgxL3JlYWxtcy9kZW1vX3JlYWxtIiwic3ViIjoiYzU3MThmN2UtZDYyNi00MzJmLThkYzctNTIwMDg2ZTMwYTEwIiwidHlwIjoiUmVmcmVzaCIsImF6cCI6ImRlbW9fY2xpZW50Iiwic2Vzc2lvbl9zdGF0ZSI6IjNkMTQ2OTk1LTY2ZjYtNGEyNS04N2U3LTkxYzczMTcxNTBlMCIsInNjb3BlIjoicHJvZmlsZSBlbWFpbCIsInNpZCI6IjNkMTQ2OTk1LTY2ZjYtNGEyNS04N2U3LTkxYzczMTcxNTBlMCJ9.0_TlcTkLqOTv8e2pZ30Wl2rshARjQvNuCo03mw8x6VA",
+    "token_type": "Bearer",
+    "not-before-policy": 0,
+    "session_state": "3d146995-66f6-4a25-87e7-91c7317150e0",
+    "scope": "profile email"
+}
+```
+access token解析以后的jwt格式如下：
+```json
+{
+  "exp": 1701395227,
+  "iat": 1701394927,
+  "jti": "dc7bf18a-1410-4ef9-b9ef-cb16218c7c40",
+  "iss": "http://localhost:8081/realms/demo_realm",
+  "aud": "account",
+  "sub": "c5718f7e-d626-432f-8dc7-520086e30a10",
+  "typ": "Bearer",
+  "azp": "demo_client",
+  "session_state": "3d146995-66f6-4a25-87e7-91c7317150e0",
+  "acr": "1",
+  "allowed-origins": [
+    "*"
+  ],
+  "realm_access": {
+    "roles": [
+      "user-role",
+      "default-roles-demo_realm",
+      "offline_access",
+      "uma_authorization"
+    ]
+  },
+  "resource_access": {
+    "account": {
+      "roles": [
+        "manage-account",
+        "manage-account-links",
+        "view-profile"
+      ]
+    }
+  },
+  "scope": "profile email",
+  "sid": "3d146995-66f6-4a25-87e7-91c7317150e0",
+  "email_verified": false,
+  "preferred_username": "user",
+  "given_name": "",
+  "family_name": ""
+}
+```
